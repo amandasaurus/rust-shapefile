@@ -1,0 +1,12 @@
+[package]
+name = "shapefile"
+version = "0.1.0"
+authors = ["Rory McCann <rory@technomancy.org>"]
+description = "Read (and write) shapefiles"
+license = "AGPL-3.0+"
+
+[dependencies]
+nom = "^2.0"
+geo = "0.3.2"
+dbf = "*"
+
