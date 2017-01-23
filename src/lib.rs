@@ -220,5 +220,34 @@ impl Shapefile {
         Some(shp_record)
 
     }
+
+    pub fn records(self) -> ShapefileIterator {
+        ShapefileIterator{ _shapefile: self, _next_rec: 0, _done: false }
+    }
 }
 
+pub struct ShapefileIterator {
+    _shapefile: Shapefile,
+    _next_rec: u32,
+    _done: bool,
+}
+
+impl ShapefileIterator {
+    pub fn into_inner(self) -> Shapefile {
+        self._shapefile
+    }
+}
+
+impl Iterator for ShapefileIterator {
+    type Item = Record;
+
+    fn next(&mut self) -> Option<Record> {
+        if self._done {
+            None
+        } else {
+            let rec = self._shapefile.record(self._next_rec);
+            self._next_rec = self._next_rec + 1;
+            rec
+        }
+    }
+}
