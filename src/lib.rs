@@ -1,14 +1,17 @@
 #[macro_use]
 extern crate nom;
-
 extern crate geo;
+extern crate dbf;
 
 use geo::*;
 
 use nom::*;
+use dbf::DbfFile;
+use dbf::Record as DbfRecord;
 
 use std::path::Path;
 use std::io::prelude::*;
+use std::io::SeekFrom;
 use std::fs::File;
 
 #[derive(Debug)]
@@ -20,6 +23,15 @@ struct Header {
     mrange: [f64; 2],
 }
 
+fn read_bytes<R: Read+Seek>(input: &mut R, start: u64, length: usize) -> Result<Vec<u8>, String> {
+    //println!("Want to read from start={} for length={} bytes to end={}", start, length, start+length as u64);
+    let mut res_vec = vec![0; length];
+
+    try!(input.seek(SeekFrom::Start(start)).map_err(|_| "couldn't seek".to_string()));
+
+    try!(input.read_exact(&mut res_vec).map_err(|_| "Couldn't read bytes".to_string()));
+    Ok(res_vec)
+}
 
 named!(parse_header<Header>,
    do_parse!(
@@ -59,6 +71,8 @@ named!(parse_bbox<Bbox<f64> >,
            ( Bbox{ xmin: xmin, ymin: ymin, xmax: xmax, ymax: ymax } )
        )
       );
+
+named!(parse_shx_offset<(i32, i32)>, tuple!( be_i32, be_i32 ) );
 
 /// Returns true iff the ring is a clockwise ring. false if anti-clockwise. presumes a valid ring
 fn ring_is_clockwise(ring: &LineString<f64>) -> bool {
@@ -126,8 +140,6 @@ fn parse_record(i: &[u8]) -> IResult<&[u8], (i32, Option<Geometry<f64>>)> {
     // FIXME there is a bug here, shape_bytes isn't big enough
     //let (i, shape_bytes) = try_parse!(i, take!(2*(rec_len-4)));
  
-    //println!("Rec {} shape {}", rec_num, shape_type);
-
     let (i, shape) = match shape_type {
         0 => { (i, None) },
         1 => { parse_point(&i).map(|p| Some(Geometry::Point(p))).unwrap() },
@@ -144,38 +156,69 @@ named!(parse_records<Vec<(i32, Option<Geometry<f64> >) > >, many0!( parse_record
 
 
 pub struct Shapefile {
+    _shp_file_handle: File,
+    _shx_file_handle: File,
+
+    _dbf_file: DbfFile<File>,
+
     _header: Header,
-    objects: Vec<Record>,
 }
 
+#[derive(Debug)]
 pub struct Record {
     id: i32,
     geometry: Option<Geometry<f64>>,
-
+    attributes: DbfRecord,
 }
 
 impl Shapefile {
     pub fn open(filename: &Path) -> Self {
-        let mut file = File::open(filename).unwrap();
-        file.seek(::std::io::SeekFrom::Start(0)).unwrap();
+        let mut shp_file = File::open(filename).unwrap();
+        let shx_filename = filename.with_extension("shx");
 
-        // TODO don't read this all in.
-        // Could use the .shx file to know what bytes to use, and then just use that to 'iterate'
+        let shx_file = File::open(shx_filename).unwrap();
+
+        let header_bytes = read_bytes(&mut shp_file, 0, 100).unwrap();
+
+        let hdr: Header = parse_header(&header_bytes).to_result().unwrap();
+
+        let dbf_file = DbfFile::open_file(&filename.with_extension("dbf")).unwrap();
+
+        Shapefile{ _header: hdr, _shp_file_handle: shp_file, _shx_file_handle: shx_file, _dbf_file: dbf_file }
+    }
+
+    pub fn read_all(&mut self) -> Vec<Record> {
+        self._shp_file_handle.seek(SeekFrom::Start(0)).unwrap();
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).unwrap();
+        self._shp_file_handle.read_to_end(&mut bytes).unwrap();
 
         let (bytes, hdr) = parse_header(&bytes).unwrap();
         println!("Header {:?}", hdr);
 
         let (bytes, recs) = parse_records(&bytes).unwrap();
         let mut objects = Vec::with_capacity(recs.len());
-        for rec in recs {
+        for (idx, rec) in recs.into_iter().enumerate() {
             let (id, geometry) = rec;
-            objects.push(Record{ id: id, geometry: geometry });
+            //println!("idx {} id {}", id
+            let attributes = self._dbf_file.record(idx as u32).unwrap();
+            objects.push(Record{ id: id, geometry: geometry, attributes: attributes });
         }
 
+        objects
+    }
 
-        Shapefile{ _header: hdr, objects: objects }
+    pub fn record(&mut self, rec_id: u32) -> Option<Record> {
+        let offset = (100 + 8 * rec_id) as u64;
+        let shx_bytes = read_bytes(&mut self._shx_file_handle, offset, 8).unwrap();
+        let shp_start_offset = parse_shx_offset(&shx_bytes).to_result().unwrap();
+        let shp_bytes = read_bytes(&mut self._shp_file_handle, (shp_start_offset.0) as u64, (shp_start_offset.1) as usize).unwrap();
+
+        let (id, geometry): (i32, Option<Geometry<f64>>) = parse_record(&shp_bytes).to_result().unwrap();
+        let attributes = self._dbf_file.record(rec_id).unwrap();
+        let shp_record = Record{ id: id, geometry: geometry, attributes: attributes };
+
+        Some(shp_record)
+
     }
 }
 
