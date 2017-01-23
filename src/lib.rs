@@ -13,6 +13,18 @@ use std::path::Path;
 use std::io::prelude::*;
 use std::io::SeekFrom;
 use std::fs::File;
+use std::result;
+
+type Result<T> = result::Result<T, ShapefileError>;
+
+#[derive(Debug)]
+pub enum ShapefileError {
+    SeekError(std::io::Error),
+    ReadExactError(std::io::Error),
+    ParseRecordError(nom::simple_errors::Err),
+    ParseShxError(nom::simple_errors::Err),
+    DbfRecordError,
+}
 
 #[derive(Debug)]
 struct Header {
@@ -23,13 +35,13 @@ struct Header {
     mrange: [f64; 2],
 }
 
-fn read_bytes<R: Read+Seek>(input: &mut R, start: u64, length: usize) -> Result<Vec<u8>, String> {
+fn read_bytes<R: Read+Seek>(input: &mut R, start: u64, length: usize) -> Result<Vec<u8>> {
     //println!("Want to read from start={} for length={} bytes to end={}", start, length, start+length as u64);
     let mut res_vec = vec![0; length];
 
-    try!(input.seek(SeekFrom::Start(start)).map_err(|_| "couldn't seek".to_string()));
+    try!(input.seek(SeekFrom::Start(start)).map_err(ShapefileError::SeekError));
 
-    try!(input.read_exact(&mut res_vec).map_err(|_| "Couldn't read bytes".to_string()));
+    try!(input.read_exact(&mut res_vec).map_err(ShapefileError::ReadExactError));
     Ok(res_vec)
 }
 
@@ -158,6 +170,7 @@ named!(parse_records<Vec<(i32, Option<Geometry<f64> >) > >, many0!( parse_record
 pub struct Shapefile {
     _shp_file_handle: File,
     _shx_file_handle: File,
+    _num_recs: u64,
 
     _dbf_file: DbfFile<File>,
 
@@ -176,6 +189,8 @@ impl Shapefile {
         let mut shp_file = File::open(filename).unwrap();
         let shx_filename = filename.with_extension("shx");
 
+        let num_recs = (shx_filename.metadata().unwrap().len() - 100) / 8;
+
         let shx_file = File::open(shx_filename).unwrap();
 
         let header_bytes = read_bytes(&mut shp_file, 0, 100).unwrap();
@@ -184,7 +199,7 @@ impl Shapefile {
 
         let dbf_file = DbfFile::open_file(&filename.with_extension("dbf")).unwrap();
 
-        Shapefile{ _header: hdr, _shp_file_handle: shp_file, _shx_file_handle: shx_file, _dbf_file: dbf_file }
+        Shapefile{ _header: hdr, _shp_file_handle: shp_file, _shx_file_handle: shx_file, _dbf_file: dbf_file, _num_recs: num_recs }
     }
 
     pub fn read_all(&mut self) -> Vec<Record> {
@@ -207,17 +222,17 @@ impl Shapefile {
         objects
     }
 
-    pub fn record(&mut self, rec_id: u32) -> Option<Record> {
+    pub fn record(&mut self, rec_id: u32) -> Result<Record> {
         let offset = (100 + 8 * rec_id) as u64;
-        let shx_bytes = read_bytes(&mut self._shx_file_handle, offset, 8).unwrap();
-        let shp_start_offset = parse_shx_offset(&shx_bytes).to_result().unwrap();
-        let shp_bytes = read_bytes(&mut self._shp_file_handle, (shp_start_offset.0) as u64, (shp_start_offset.1) as usize).unwrap();
+        let shx_bytes = try!(read_bytes(&mut self._shx_file_handle, offset, 8));
+        let shp_start_offset = try!(parse_shx_offset(&shx_bytes).to_result().map_err(ShapefileError::ParseShxError));
+        let shp_bytes = try!(read_bytes(&mut self._shp_file_handle, (shp_start_offset.0) as u64, (shp_start_offset.1) as usize));
 
-        let (id, geometry): (i32, Option<Geometry<f64>>) = parse_record(&shp_bytes).to_result().unwrap();
-        let attributes = self._dbf_file.record(rec_id).unwrap();
+        let (id, geometry): (i32, Option<Geometry<f64>>) = try!(parse_record(&shp_bytes).to_result().map_err(ShapefileError::ParseRecordError));
+        let attributes = try!(self._dbf_file.record(rec_id).ok_or(ShapefileError::DbfRecordError));
         let shp_record = Record{ id: id, geometry: geometry, attributes: attributes };
 
-        Some(shp_record)
+        Ok(shp_record)
 
     }
 
@@ -228,7 +243,7 @@ impl Shapefile {
 
 pub struct ShapefileIterator {
     _shapefile: Shapefile,
-    _next_rec: u32,
+    _next_rec: u64,
     _done: bool,
 }
 
@@ -242,12 +257,12 @@ impl Iterator for ShapefileIterator {
     type Item = Record;
 
     fn next(&mut self) -> Option<Record> {
-        if self._done {
+        if self._next_rec > self._shapefile._num_recs {
             None
         } else {
-            let rec = self._shapefile.record(self._next_rec);
+            let rec = self._shapefile.record(self._next_rec as u32);
             self._next_rec = self._next_rec + 1;
-            rec
+            rec.ok()
         }
     }
 }
